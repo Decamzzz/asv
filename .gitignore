@@ -1,0 +1,58 @@
+# ─── Python ───────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# ─── Distribution / Packaging ─────────────────────────────
+build/
+dist/
+wheels/
+*.egg-info/
+*.egg
+MANIFEST
+
+# ─── Virtual Environments ─────────────────────────────────
+.venv/
+venv/
+ENV/
+
+# ─── IDE / Editor ─────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.project
+.classpath
+.settings/
+
+# ─── Testing / Coverage ──────────────────────────────────
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache/
+.pytest_cache/
+nosetests.xml
+coverage.xml
+*.cover
+
+# ─── Type Checking ────────────────────────────────────────
+.mypy_cache/
+.pytype/
+
+# ─── OS Files ─────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ─── Package Manager Lock (uv) ────────────────────────────
+# Uncomment the next line if you do NOT want to track the lockfile
+# uv.lock
+
+# ─── ASV Runtime Data ────────────────────────────────────
+# Never commit encrypted realm data or session files
+*.enc
+*.snapshot

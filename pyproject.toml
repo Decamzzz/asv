@@ -1,0 +1,19 @@
+[project]
+name = "asv"
+version = "0.1.0"
+description = "A complete file encryption and decryption CLI system for Linux"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "click>=8.0",
+    "cryptography>=42.0",
+    "password-strength>=0.0.3",
+    "rich>=13.0",
+]
+
+[project.scripts]
+asv = "asv.cli.main:cli"
+
+[tool.uv]
+package = true
+
