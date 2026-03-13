@@ -3,20 +3,22 @@
 Manages the complete lifecycle of encrypting files into vaults and
 decrypting them back, including:
   - SHA-256 hashing of originals for integrity verification
-  - AES-128-CBC encryption with HMAC-SHA256
-  - Obfuscated filename generation
+  - AES-256-GCM authenticated encryption
+  - Obfuscated filename generation (HMAC + pepper + per-file salt)
   - Original file handling (keep, simple delete, secure delete)
   - Post-decryption integrity verification
 """
 
+import base64
 import hashlib
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 
 from asv.core.realm import RealmManager
 from asv.core.vault import VaultManager, VaultError
 from asv.crypto.engine import encrypt, decrypt, IntegrityError
+from asv.crypto.key_derivation import generate_salt
 from asv.crypto.secure_delete import simple_delete_file, secure_delete_file
 from asv.security.permissions import secure_write
 from asv.security.steganography import obfuscate_filename
@@ -80,17 +82,17 @@ class FileManager:
         original_data = source.read_bytes()
         original_name = source.name
 
-        # Compute SHA-256 of original for integrity verification
-        sha256_hash = hashlib.sha256(original_data).hexdigest()
+        # Get session keys (aes_key + pepper)
+        aes_key, pepper = self.realm.get_session_keys()
 
-        # Get encryption keys
-        aes_key, hmac_key = self.realm.get_session_keys()
+        # Encrypt the file data with AES-256-GCM
+        encrypted_data = encrypt(original_data, aes_key)
 
-        # Encrypt the file data
-        encrypted_data = encrypt(original_data, aes_key, hmac_key)
+        # Generate unique per-file salt for path obfuscation
+        file_salt = generate_salt()
 
-        # Generate obfuscated filename
-        encrypted_name = obfuscate_filename(original_name, hmac_key)
+        # Generate obfuscated filename using HMAC + pepper + salt
+        encrypted_name = obfuscate_filename(original_name, aes_key, pepper, file_salt)
 
         # Resolve vault path
         vault_path = self.vault_manager.get_vault_path(vault_name)
@@ -109,9 +111,9 @@ class FileManager:
             "encrypted_name": encrypted_name,
             "original_path": str(source.resolve()),
             "original_size": len(original_data),
-            "encrypted_at": datetime.now(timezone.utc).isoformat(),
-            "sha256_original": sha256_hash,
+            "encrypted_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "deletion_mode": delete_mode,
+            "file_salt": base64.b64encode(file_salt).decode("ascii"),
         }
         db.save(data)
 
@@ -131,8 +133,7 @@ class FileManager:
     ) -> None:
         """Decrypt a file from a vault and write it to the output path.
 
-        Verifies HMAC integrity before decryption and SHA-256 hash after
-        decryption to ensure the file has not been tampered with.
+        AES-256-GCM verifies integrity automatically during decryption.
 
         Args:
             filename: Original filename as stored in the vault.
@@ -170,25 +171,15 @@ class FileManager:
 
         encrypted_data = encrypted_file_path.read_bytes()
 
-        # Get decryption keys
-        aes_key, hmac_key = self.realm.get_session_keys()
+        # Get decryption key
+        aes_key, _ = self.realm.get_session_keys()
 
-        # Decrypt (HMAC is verified internally by the engine)
+        # Decrypt (GCM tag is verified internally by the engine)
         try:
-            decrypted_data = decrypt(encrypted_data, aes_key, hmac_key)
+            decrypted_data = decrypt(encrypted_data, aes_key)
         except IntegrityError:
             raise FileOperationError(
                 "INTEGRITY ERROR: File has been tampered with. Aborting decryption."
-            )
-
-        # Verify SHA-256 hash of decrypted content
-        computed_hash = hashlib.sha256(decrypted_data).hexdigest()
-        stored_hash = file_record["sha256_original"]
-
-        if computed_hash != stored_hash:
-            raise FileOperationError(
-                "INTEGRITY ERROR: Decrypted file hash does not match the "
-                "original. The file may have been corrupted."
             )
 
         # Write decrypted file

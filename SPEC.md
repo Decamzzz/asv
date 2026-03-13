@@ -1,8 +1,8 @@
 # ASV — Specification Document
 
-> **Version:** 0.1.0 (MVP)
+> **Version:** 0.2.0
 > **Status:** Draft
-> **Last Updated:** 2026-03-05
+> **Last Updated:** 2026-03-12
 > **Python:** ≥ 3.12
 > **Platform:** Linux
 
@@ -38,19 +38,20 @@ ASV is a command-line file encryption and decryption system for Linux. It priori
 
 | Property | Value |
 |----------|-------|
-| **Algorithm** | AES-128-CBC |
-| **Block Size** | 16 bytes |
-| **IV** | Random 16 bytes per encryption operation |
-| **Padding** | PKCS7 |
-| **Integrity** | HMAC-SHA256 appended to ciphertext |
+| **Algorithm** | AES-256-GCM (Galois/Counter Mode) |
+| **Key Size** | 256 bits (32 bytes) |
+| **Nonce/IV** | Random 12 bytes per encryption operation |
+| **Integrity** | Built-in GCM authentication tag (16 bytes) |
 
 **Encrypted file format (binary):**
 
 ```
-[16 bytes IV] [N bytes ciphertext (PKCS7 padded)] [32 bytes HMAC-SHA256]
+[12 bytes nonce] [N bytes ciphertext] [16 bytes GCM auth tag]
 ```
 
-The HMAC is computed over `IV + ciphertext` using a separate HMAC key derived alongside the encryption key.
+AES-256-GCM provides authenticated encryption with associated data (AEAD),
+meaning both confidentiality and integrity are guaranteed in a single operation.
+No separate HMAC or padding is required.
 
 ### 2.2 Key Derivation
 
@@ -59,7 +60,10 @@ The HMAC is computed over `IV + ciphertext` using a separate HMAC key derived al
 | **Algorithm** | PBKDF2-HMAC-SHA256 |
 | **Iterations** | 480,000 |
 | **Salt** | 16 bytes, cryptographically random (`os.urandom`) |
-| **Output Length** | 48 bytes → split into 16-byte AES key + 32-byte HMAC key |
+| **Output Length** | 32 bytes → used directly as AES-256 key |
+
+With AES-256-GCM providing built-in authentication, no separate HMAC key is
+needed. The full 32-byte derived key is used as the AES-256 encryption key.
 
 The salt is stored in plaintext alongside the encrypted data (it is not secret).
 
@@ -89,13 +93,30 @@ Permissions are set immediately upon creation using `os.chmod()`.
 
 ### 2.5 Steganographic Path Obfuscation
 
-All storage paths are obfuscated to prevent casual identification:
+All storage paths are obfuscated to prevent casual identification using a
+triple-layer scheme:
 
-- **Realm directory:** `~/.local/share/asv/.data_<hex8>` (hidden with dot prefix and random hex suffix).
-- **Vault directories:** Named with HMAC-derived hashes of the vault name, e.g., `v_<hex16>`.
-- **Encrypted files:** Stored with HMAC-derived filenames, e.g., `f_<hex16>.enc`.
+```
+HMAC-SHA256(aes_key, name + pepper + salt)
+```
 
-The mapping from human-readable names to obfuscated paths is stored exclusively in the encrypted database.
+| Component | Description |
+|-----------|-------------|
+| **AES key** | 32-byte key derived from the master password (used as HMAC key) |
+| **Pepper** | 32-byte random value, generated once per realm (global), stored encrypted |
+| **Salt** | 16-byte random value, unique per vault/file, stored in the encrypted database |
+
+This combination makes obfuscated paths indistinguishable from random noise. An
+attacker cannot determine whether two paths belong to the same system without
+knowing all three components.
+
+- **Realm directory:** `~/.local/share/asv/.r_<hex8>` (hidden with dot prefix and random hex suffix).
+- **Vault directories:** Named with HMAC-derived hashes, e.g., `v_<hex16>` (HMAC + pepper + per-vault salt).
+- **Encrypted files:** Stored with HMAC-derived filenames, e.g., `f_<hex16>.enc` (HMAC + pepper + per-file salt).
+
+The mapping from human-readable names to obfuscated paths (including per-item salts) is
+stored exclusively in the encrypted database. The pepper is stored encrypted at
+`pepper.enc` within the realm directory.
 
 ### 2.6 Secure File Deletion
 
@@ -105,7 +126,7 @@ Three modes for handling the original file after encryption:
 |------|---------|
 | `keep` | Original file is untouched. |
 | `simple` | Original file is deleted via `os.remove()` (pointer removal). |
-| `secure` | Original file is overwritten with random bytes matching its size, then deleted. The file is effectively irrecoverable. |
+| `secure` | Original file is overwritten with random bytes matching its size, then deleted. The file is NOT effectively irrecoverable. |
 
 ---
 
@@ -119,27 +140,28 @@ The database is a JSON document encrypted at rest using the realm's derived key 
 
 ```json
 {
-  "version": "0.1.0",
+  "version": "0.2.0",
   "realm": {
     "name": "default",
-    "created_at": "2026-03-05T22:00:00Z",
+    "created_at": "2026-03-12 13:05:45",
     "salt": "<base64>",
     "password_hash": "<base64 PBKDF2 verification hash>"
   },
   "vaults": {
     "<vault_name>": {
       "id": "<uuid4>",
-      "created_at": "2026-03-05T22:00:00Z",
+      "created_at": "2026-03-12 13:05:45",
       "obfuscated_dir": "v_<hex16>",
+      "vault_salt": "<base64>",
       "files": {
         "<original_filename>": {
           "id": "<uuid4>",
           "encrypted_name": "f_<hex16>.enc",
           "original_path": "/path/to/original",
           "original_size": 1024,
-          "encrypted_at": "2026-03-05T22:00:00Z",
-          "sha256_original": "<hex64>",
-          "deletion_mode": "keep|simple|secure"
+          "encrypted_at": "2026-03-12 13:05:45",
+          "deletion_mode": "keep|simple|secure",
+          "file_salt": "<base64>"
         }
       }
     }
@@ -162,10 +184,12 @@ This guarantees atomicity: the database is never in a half-written state.
 
 ```
 ~/.local/share/asv/.data_<hex8>/
-├── db.enc            # Encrypted database
+├── db.enc            # Encrypted database (AES-256-GCM)
 ├── db.snapshot       # Temporary snapshot (only during writes)
+├── salt              # PBKDF2 salt (plaintext, not secret)
+├── pepper.enc        # Global pepper (encrypted with AES-256-GCM)
 └── vaults/
-    ├── v_<hex16>/    # Obfuscated vault directory
+    ├── v_<hex16>/    # Obfuscated vault directory (HMAC+pepper+salt)
     │   ├── f_<hex16>.enc
     │   └── f_<hex16>.enc
     └── v_<hex16>/
@@ -183,7 +207,8 @@ asv/
 ├── main.py                    # Entry point
 ├── SPEC.md                    # This specification
 ├── pyproject.toml             # Dependencies and project metadata
-└── asv/                    # Main package
+├── README.md               
+└── asv/                       # Main package
     ├── __init__.py
     ├── cli/                   # CLI layer (Click commands)
     │   ├── __init__.py
@@ -198,7 +223,7 @@ asv/
     │   └── file_ops.py        # File encrypt/decrypt orchestration
     ├── crypto/                # Cryptographic primitives
     │   ├── __init__.py
-    │   ├── engine.py          # AES-128-CBC + HMAC-SHA256
+    │   ├── engine.py          # AES-256-GCM authenticated encryption
     │   ├── key_derivation.py  # PBKDF2-HMAC-SHA256
     │   └── secure_delete.py   # Secure file overwrite & delete
     ├── db/                    # Database layer
@@ -270,8 +295,7 @@ asv
 #### `asv realm status`
 - Shows: locked/unlocked, vault count, total encrypted files.
 
-#### `asv vault create <name>`
-- Requires unlocked realm.
+#### `asv vault create <vault name>`
 - Creates obfuscated vault directory.
 - Updates database with vault metadata.
 
@@ -279,24 +303,24 @@ asv
 - Requires unlocked realm.
 - Lists all vaults with creation date and file count.
 
-#### `asv vault delete <name>`
+#### `asv vault delete <vault name>`
 - Requires unlocked realm.
 - Prompts for confirmation.
 - Deletes all encrypted files within the vault.
 - Removes vault directory and database entry.
 
-#### `asv file encrypt <path> --vault <name>`
+#### `asv file encrypt <file path> --vault <vault name>`
 - Requires unlocked realm.
 - Prompts for original file handling: `keep`, `simple-delete`, `secure-delete`.
 - Computes SHA-256 hash of original file.
-- Encrypts file using AES-128-CBC with HMAC-SHA256.
+- Encrypts file using AES-256-GCM.
 - Stores encrypted file in vault's obfuscated directory.
 - Updates database with file metadata.
 - Handles original per user's choice.
 
 #### `asv file decrypt <filename> --vault <name> --output <path>`
 - Requires unlocked realm.
-- Verifies HMAC integrity before decryption.
+- GCM authentication tag is verified automatically during decryption.
 - Decrypts file and writes to output path.
 - Verifies SHA-256 hash of decrypted file against stored hash.
 - Sets permissions on output file.
@@ -361,7 +385,7 @@ These are **not** part of the MVP but are anticipated:
 - [ ] Compression before encryption (gzip)
 - [ ] Key rotation
 - [ ] Export/import functionality
-- [ ] AES-256-GCM upgrade option
+- [x] ~~AES-256-GCM upgrade option~~ (implemented in v0.2.0)
 - [ ] Configurable PBKDF2 iteration count
 - [ ] REST API mode
 - [ ] Systemd integration for session timeout

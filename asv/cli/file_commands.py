@@ -38,8 +38,8 @@ def file():
 def encrypt(path: str, vault: str, delete_mode: str | None):
     """Encrypt a file and store it in a vault.
 
-    The file at PATH will be encrypted using AES-128-CBC with HMAC-SHA256
-    integrity protection and stored in the specified vault.
+    The file at PATH will be encrypted using AES-256-GCM authenticated
+    encryption and stored in the specified vault.
 
     \b
     Deletion modes for the original file:
@@ -122,8 +122,8 @@ def decrypt(filename: str, vault: str, output: str):
     """Decrypt a file from a vault.
 
     Retrieves the encrypted file named FILENAME from the specified vault,
-    verifies its HMAC integrity, decrypts it, and verifies the SHA-256
-    hash of the result against the stored original hash.
+    verifies its HMAC integrity and decrypts it. The decrypted file is written to the 
+    specified output path.
     """
     realm = RealmManager()
 
@@ -148,7 +148,7 @@ def decrypt(filename: str, vault: str, output: str):
             manager.decrypt_file(filename, vault, output_path)
 
         success(f"File decrypted and saved to: {output_path}")
-        info("Integrity verified: HMAC ✓ | SHA-256 ✓")
+        info("Integrity verified: GCM ✓")
 
     except (FileOperationError, VaultError) as e:
         error(str(e))

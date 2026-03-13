@@ -3,13 +3,18 @@
 Vaults are named logical containers within a realm. Each vault has an
 obfuscated directory for storing encrypted files, and its metadata is
 tracked in the encrypted database.
+
+Vault directory names are obfuscated using HMAC + pepper + per-vault salt,
+making them indistinguishable from random noise.
 """
 
+import base64
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
 from asv.core.realm import RealmManager
+from asv.crypto.key_derivation import generate_salt
 from asv.security.permissions import secure_mkdir
 from asv.security.steganography import obfuscate_vault_dir
 
@@ -44,9 +49,14 @@ class VaultManager:
         if name in data["vaults"]:
             raise VaultError(f"Vault '{name}' already exists.")
 
-        # Generate obfuscated directory name
-        _, hmac_key = self.realm.get_session_keys()
-        obfuscated_dir = obfuscate_vault_dir(name, hmac_key)
+        # Get AES key and pepper for obfuscation
+        aes_key, pepper = self.realm.get_session_keys()
+
+        # Generate unique per-vault salt for path obfuscation
+        vault_salt = generate_salt()
+
+        # Generate obfuscated directory name using HMAC + pepper + salt
+        obfuscated_dir = obfuscate_vault_dir(name, aes_key, pepper, vault_salt)
 
         # Create the vault directory
         vaults_base = self.realm._get_vaults_dir()
@@ -56,8 +66,9 @@ class VaultManager:
         # Update database
         data["vaults"][name] = {
             "id": str(uuid.uuid4()),
-            "created_at": datetime.now(timezone.utc).isoformat(),
+            "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "obfuscated_dir": obfuscated_dir,
+            "vault_salt": base64.b64encode(vault_salt).decode("ascii"),
             "files": {},
         }
         db.save(data)

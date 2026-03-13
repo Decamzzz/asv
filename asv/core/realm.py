@@ -6,8 +6,11 @@ The Realm is the root-level container in ASV. It manages:
   - Locking (session key clearance)
   - Status reporting
 
-Session keys are stored in a temporary file at /tmp/asv_session_<uid>
-with 0600 permissions. This is a pragmatic MVP approach.
+Security model:
+  - AES-256-GCM for all encryption (no separate HMAC key needed)
+  - A global 32-byte pepper is generated per realm for path obfuscation
+  - Session key is stored in a temporary file at /tmp/asv_session_<uid>
+    with 0600 permissions (pragmatic MVP approach)
 """
 
 import base64
@@ -16,7 +19,12 @@ import os
 from datetime import datetime, timezone
 from pathlib import Path
 
-from asv.crypto.key_derivation import derive_keys, generate_salt, hash_password
+from asv.crypto.key_derivation import (
+    derive_key,
+    generate_salt,
+    generate_pepper,
+    hash_password,
+)
 from asv.db.database import Database
 from asv.security.password import validate_password
 from asv.security.permissions import secure_mkdir, secure_write
@@ -84,9 +92,9 @@ class RealmManager:
     def init_realm(self, password: str) -> None:
         """Initialize a new realm.
 
-        Validates the password, derives encryption keys, creates the
-        obfuscated realm directory structure, and initializes the
-        encrypted database.
+        Validates the password, derives the AES-256 encryption key, generates
+        a global pepper for path obfuscation, creates the obfuscated realm
+        directory structure, and initializes the encrypted database.
 
         Args:
             password: The master password for the realm.
@@ -108,13 +116,17 @@ class RealmManager:
                 + "\n".join(f"  • {f}" for f in failures)
             )
 
-        # Generate salt and derive keys
+        # Generate salt and derive AES-256 key
         salt = generate_salt()
-        aes_key, hmac_key = derive_keys(password, salt)
+        aes_key = derive_key(password, salt)
         pwd_hash = hash_password(password, salt)
 
+        # Generate global pepper for path obfuscation
+        pepper = generate_pepper()
+
         # Create obfuscated realm directory
-        realm_dir_name = obfuscate_realm_dir()
+        # Later we can support multiple realms by using different names here, but for MVP we hardcode "default"
+        realm_dir_name = obfuscate_realm_dir("default", aes_key, pepper, salt)
         realm_dir = ASV_BASE / realm_dir_name
         secure_mkdir(realm_dir)
 
@@ -133,13 +145,18 @@ class RealmManager:
         # Save salt to plaintext file (salt is not secret, per SPEC §2.2)
         secure_write(realm_dir / "salt", salt)
 
+        # Save pepper (encrypted with AES-256-GCM using the derived key)
+        from asv.crypto.engine import encrypt as aes_encrypt
+        encrypted_pepper = aes_encrypt(pepper, aes_key)
+        secure_write(realm_dir / "pepper.enc", encrypted_pepper)
+
         # Initialize encrypted database
-        db = Database(realm_dir / "db.enc", aes_key, hmac_key)
+        db = Database(realm_dir / "db.enc", aes_key)
         realm_data = {
             "version": "0.1.0",
             "realm": {
                 "name": "default",
-                "created_at": datetime.now(timezone.utc).isoformat(),
+                "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 "salt": base64.b64encode(salt).decode("ascii"),
                 "password_hash": base64.b64encode(pwd_hash).decode("ascii"),
             },
@@ -152,9 +169,9 @@ class RealmManager:
     def unlock(self, password: str) -> None:
         """Unlock the realm with the master password.
 
-        Derives keys from the password and verifies them by attempting
-        to decrypt the database. On success, stores the session keys
-        in a temp file.
+        Derives the AES-256 key from the password, verifies it by attempting
+        to decrypt the database, and on success stores the session key and
+        pepper in a temp file.
 
         Args:
             password: The master password.
@@ -167,26 +184,18 @@ class RealmManager:
                 "No realm found. Run 'asv realm init' to create one."
             )
 
-        # Load the database to get the salt
         realm_dir = self._get_realm_dir()
-        db_path = realm_dir / "db.enc"
 
-        # We need to try different salts — but we don't know the salt yet
-        # without decrypting. The salt is stored in the DB itself.
-        # Solution: try to derive keys with a stored salt hint.
-        #
-        # Actually, we need a bootstrap mechanism. Let's store the salt
-        # in a separate plaintext file (salt is not secret per SPEC §2.2).
+        # Load the salt (stored in plaintext, not secret per SPEC §2.2)
         salt_file = realm_dir / "salt"
         if not salt_file.exists():
-            # Migration: extract salt from config if needed
             raise RealmError("Salt file missing. Realm may be corrupted.")
 
         salt = salt_file.read_bytes()
-        aes_key, hmac_key = derive_keys(password, salt)
+        aes_key = derive_key(password, salt)
 
         # Verify by attempting to decrypt the database
-        db = Database(db_path, aes_key, hmac_key)
+        db = Database(self._get_db_path(), aes_key)
         try:
             data = db.load()
         except Exception:
@@ -198,10 +207,21 @@ class RealmManager:
         if stored_hash != computed_hash:
             raise RealmError("Incorrect password. Please try again.")
 
-        # Store session keys
+        # Decrypt the pepper
+        pepper_file = realm_dir / "pepper.enc"
+        if not pepper_file.exists():
+            raise RealmError("Pepper file missing. Realm may be corrupted.")
+
+        from asv.crypto.engine import decrypt as aes_decrypt
+        try:
+            pepper = aes_decrypt(pepper_file.read_bytes(), aes_key)
+        except Exception:
+            raise RealmError("Failed to decrypt pepper. Realm may be corrupted.")
+
+        # Store session key and pepper
         session_data = {
             "aes_key": base64.b64encode(aes_key).decode("ascii"),
-            "hmac_key": base64.b64encode(hmac_key).decode("ascii"),
+            "pepper": base64.b64encode(pepper).decode("ascii"),
         }
         secure_write(
             SESSION_FILE,
@@ -224,10 +244,10 @@ class RealmManager:
         return SESSION_FILE.exists()
 
     def get_session_keys(self) -> tuple[bytes, bytes]:
-        """Load the session keys from the temp file.
+        """Load the session key and pepper from the temp file.
 
         Returns:
-            Tuple of (aes_key, hmac_key).
+            Tuple of (aes_key, pepper).
 
         Raises:
             RealmError: If the realm is locked.
@@ -239,8 +259,8 @@ class RealmManager:
 
         session_data = json.loads(SESSION_FILE.read_text())
         aes_key = base64.b64decode(session_data["aes_key"])
-        hmac_key = base64.b64decode(session_data["hmac_key"])
-        return aes_key, hmac_key
+        pepper = base64.b64decode(session_data["pepper"])
+        return aes_key, pepper
 
     def get_database(self) -> Database:
         """Get an authenticated Database instance.
@@ -251,8 +271,8 @@ class RealmManager:
         Raises:
             RealmError: If the realm is locked.
         """
-        aes_key, hmac_key = self.get_session_keys()
-        return Database(self._get_db_path(), aes_key, hmac_key)
+        aes_key, _ = self.get_session_keys()
+        return Database(self._get_db_path(), aes_key)
 
     def get_status(self) -> dict:
         """Get the current realm status.

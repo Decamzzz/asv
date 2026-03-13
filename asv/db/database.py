@@ -1,8 +1,11 @@
 """Encrypted JSON database with data-at-rest protection.
 
 The database stores all ASV metadata (realm config, vaults, file records)
-as a JSON document encrypted with AES-128-CBC + HMAC-SHA256. All reads
-decrypt the data in memory; all writes re-encrypt before flushing to disk.
+as a JSON document encrypted with AES-256-GCM. All reads decrypt the data
+in memory; all writes re-encrypt before flushing to disk.
+
+AES-256-GCM provides authenticated encryption, so no separate HMAC key
+is needed — integrity is verified automatically during decryption.
 
 Writes are protected by the Snapshot system to prevent corruption.
 """
@@ -24,14 +27,12 @@ class Database:
 
     Args:
         db_path: Path to the encrypted database file.
-        key: 16-byte AES encryption key.
-        hmac_key: 32-byte HMAC key for integrity verification.
+        key: 32-byte AES-256 encryption key.
     """
 
-    def __init__(self, db_path: Path, key: bytes, hmac_key: bytes) -> None:
+    def __init__(self, db_path: Path, key: bytes) -> None:
         self.db_path = db_path
         self.key = key
-        self.hmac_key = hmac_key
 
     def exists(self) -> bool:
         """Check if the database file exists."""
@@ -39,6 +40,8 @@ class Database:
 
     def load(self) -> dict:
         """Decrypt and load the database contents.
+
+        AES-256-GCM automatically verifies integrity during decryption.
 
         Returns:
             The deserialized JSON data as a dictionary.
@@ -48,7 +51,7 @@ class Database:
         """
         try:
             encrypted_data = self.db_path.read_bytes()
-            plaintext = decrypt(encrypted_data, self.key, self.hmac_key)
+            plaintext = decrypt(encrypted_data, self.key)
             return json.loads(plaintext.decode("utf-8"))
         except Exception as e:
             raise DatabaseError(f"Failed to load database: {e}") from e
@@ -68,7 +71,7 @@ class Database:
         try:
             with Snapshot(self.db_path):
                 plaintext = json.dumps(data, indent=2).encode("utf-8")
-                encrypted_data = encrypt(plaintext, self.key, self.hmac_key)
+                encrypted_data = encrypt(plaintext, self.key)
                 secure_write(self.db_path, encrypted_data)
         except Exception as e:
             raise DatabaseError(f"Failed to save database: {e}") from e
@@ -87,7 +90,7 @@ class Database:
 
         try:
             plaintext = json.dumps(realm_data, indent=2).encode("utf-8")
-            encrypted_data = encrypt(plaintext, self.key, self.hmac_key)
+            encrypted_data = encrypt(plaintext, self.key)
             secure_write(self.db_path, encrypted_data)
         except Exception as e:
             raise DatabaseError(f"Failed to initialize database: {e}") from e

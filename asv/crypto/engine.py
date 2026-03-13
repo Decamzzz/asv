@@ -1,92 +1,76 @@
-"""AES-128-CBC encryption engine with HMAC-SHA256 integrity validation.
+"""AES-256-GCM authenticated encryption engine.
 
 This module provides the low-level encrypt/decrypt operations used throughout
 ASV. Every encrypted blob follows the format:
 
-    [16 bytes IV] [N bytes ciphertext (PKCS7)] [32 bytes HMAC-SHA256]
+    [12 bytes IV/nonce] [N bytes ciphertext + 16 bytes GCM auth tag]
 
-The HMAC is computed over IV + ciphertext to detect tampering.
+AES-256-GCM provides authenticated encryption with associated data (AEAD),
+which means integrity and confidentiality are guaranteed in a single pass.
+No separate HMAC or padding is required.
 """
 
-import hmac
-import hashlib
 import os
 
-from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-from cryptography.hazmat.primitives import padding
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 
 class IntegrityError(Exception):
-    """Raised when HMAC verification fails, indicating data tampering."""
+    """Raised when GCM authentication fails, indicating data tampering."""
 
 
-def encrypt(data: bytes, key: bytes, hmac_key: bytes) -> bytes:
-    """Encrypt data using AES-128-CBC with PKCS7 padding and HMAC-SHA256.
+def encrypt(data: bytes, key: bytes) -> bytes:
+    """Encrypt data using AES-256-GCM.
+
+    AES-256-GCM provides authenticated encryption: the ciphertext includes
+    a 16-byte authentication tag that guarantees both confidentiality and
+    integrity without needing a separate HMAC.
 
     Args:
         data: Plaintext bytes to encrypt.
-        key: 16-byte AES encryption key.
-        hmac_key: 32-byte key for HMAC-SHA256 integrity tag.
+        key: 32-byte AES-256 encryption key.
 
     Returns:
-        Encrypted blob: IV (16B) + ciphertext + HMAC (32B).
+        Encrypted blob: nonce (12B) + ciphertext_with_tag.
     """
-    # Generate random IV
-    iv = os.urandom(16)
-
-    # Pad plaintext with PKCS7
-    padder = padding.PKCS7(128).padder()
-    padded_data = padder.update(data) + padder.finalize()
-
-    # Encrypt with AES-128-CBC
-    cipher = Cipher(algorithms.AES128(key), modes.CBC(iv))
-    encryptor = cipher.encryptor()
-    ciphertext = encryptor.update(padded_data) + encryptor.finalize()
-
-    # Compute HMAC-SHA256 over IV + ciphertext
-    tag = hmac.new(hmac_key, iv + ciphertext, hashlib.sha256).digest()
-
-    return iv + ciphertext + tag
+    nonce = os.urandom(12)
+    aesgcm = AESGCM(key)
+    ciphertext_with_tag = aesgcm.encrypt(nonce, data, None)
+    return nonce + ciphertext_with_tag
 
 
-def decrypt(data: bytes, key: bytes, hmac_key: bytes) -> bytes:
-    """Decrypt an AES-128-CBC encrypted blob with HMAC-SHA256 verification.
+def decrypt(data: bytes, key: bytes) -> bytes:
+    """Decrypt an AES-256-GCM encrypted blob.
+
+    Verifies the GCM authentication tag automatically. If the data has been
+    tampered with, an IntegrityError is raised.
 
     Args:
-        data: Encrypted blob (IV + ciphertext + HMAC).
-        key: 16-byte AES decryption key.
-        hmac_key: 32-byte key for HMAC-SHA256 verification.
+        data: Encrypted blob (nonce + ciphertext_with_tag).
+        key: 32-byte AES-256 decryption key.
 
     Returns:
         Decrypted plaintext bytes.
 
     Raises:
-        IntegrityError: If the HMAC does not match (data was tampered with).
-        ValueError: If the data is too short to contain IV + HMAC.
+        IntegrityError: If the GCM tag verification fails (data was tampered).
+        ValueError: If the data is too short to contain nonce + tag.
     """
-    # Minimum size: 16 (IV) + 16 (at least one block) + 32 (HMAC)
-    if len(data) < 64:
-        raise ValueError("Encrypted data is too short to be valid.")
-
-    # Split components
-    iv = data[:16]
-    ciphertext = data[16:-32]
-    stored_tag = data[-32:]
-
-    # Verify HMAC before decrypting (verify-then-decrypt)
-    computed_tag = hmac.new(hmac_key, iv + ciphertext, hashlib.sha256).digest()
-    if not hmac.compare_digest(stored_tag, computed_tag):
-        raise IntegrityError(
-            "HMAC verification failed. Data may have been tampered with."
+    if len(data) < 28:  # 12 (nonce) + 16 (min tag)
+        raise ValueError(
+            "Encrypted data is too short. Expected at least 28 bytes "
+            "(12 nonce + 16 auth tag)."
         )
 
-    # Decrypt with AES-128-CBC
-    cipher = Cipher(algorithms.AES128(key), modes.CBC(iv))
-    decryptor = cipher.decryptor()
-    padded_data = decryptor.update(ciphertext) + decryptor.finalize()
+    nonce = data[:12]
+    ciphertext_with_tag = data[12:]
 
-    # Remove PKCS7 padding
-    unpadder = padding.PKCS7(128).unpadder()
-    plaintext = unpadder.update(padded_data) + unpadder.finalize()
+    aesgcm = AESGCM(key)
+    try:
+        plaintext = aesgcm.decrypt(nonce, ciphertext_with_tag, None)
+    except Exception as e:
+        raise IntegrityError(
+            "GCM authentication failed: data has been tampered with."
+        ) from e
 
     return plaintext

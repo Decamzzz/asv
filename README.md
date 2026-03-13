@@ -1,8 +1,8 @@
 <p align="center">
   <img src="https://img.shields.io/badge/python-%3E%3D3.12-3776AB?style=for-the-badge&logo=python&logoColor=white" alt="Python 3.12+">
   <img src="https://img.shields.io/badge/platform-Linux-FCC624?style=for-the-badge&logo=linux&logoColor=black" alt="Linux">
-  <img src="https://img.shields.io/badge/encryption-AES--128--CBC-00C853?style=for-the-badge&logo=gnuprivacyguard&logoColor=white" alt="AES-128-CBC">
-  <img src="https://img.shields.io/badge/version-0.1.0-FF6D00?style=for-the-badge" alt="v0.1.0">
+  <img src="https://img.shields.io/badge/encryption-AES--256--GCM-00C853?style=for-the-badge&logo=gnuprivacyguard&logoColor=white" alt="AES-256-GCM">
+  <img src="https://img.shields.io/badge/version-0.2.0-FF6D00?style=for-the-badge" alt="v0.2.0">
   <img src="https://img.shields.io/badge/license-MIT-blue?style=for-the-badge" alt="MIT License">
 </p>
 
@@ -22,11 +22,12 @@
 
 | Feature | Description |
 |---------|-------------|
-| **🔑 AES-128-CBC Encryption** | Industry-standard symmetric encryption with random IV per operation |
-| **🛡️ HMAC-SHA256 Integrity** | Every encrypted file is integrity-verified before decryption |
-| **🔒 PBKDF2 Key Derivation** | 480,000 iterations to defeat brute-force attacks |
-| **🫥 Steganographic Paths** | Vault and file paths are obfuscated with HMAC-derived hashes |
-| **📦 Encrypted Database** | All metadata is encrypted at rest — zero plaintext exposure |
+| **🔑 AES-256-GCM Encryption** | Authenticated encryption with associated data (AEAD) — confidentiality and integrity in a single pass |
+| **🛡️ Built-in GCM Authentication** | 16-byte authentication tag verifies integrity automatically during decryption — no separate HMAC needed |
+| **🔒 PBKDF2 Key Derivation** | 480,000 iterations with HMAC-SHA256 to derive a 32-byte AES-256 key |
+| **🫥 Triple-Layer Path Obfuscation** | Vault and file paths obfuscated via `HMAC-SHA256(key, name + pepper + salt)` — indistinguishable from random noise |
+| **🌶️ Pepper + Salt Scheme** | Global 32-byte pepper per realm + unique 16-byte salt per vault/file for maximum path entropy |
+| **📦 Encrypted Database** | All metadata encrypted at rest with AES-256-GCM — zero plaintext exposure |
 | **💾 Atomic Snapshots** | Database snapshots before every write guarantee data integrity |
 | **🗑️ Secure File Deletion** | Overwrite originals with random bytes before deletion |
 | **🏗️ Vault Organization** | Organize encrypted files into named, logical vaults |
@@ -49,9 +50,9 @@ CLI Layer  →  Core Layer  →  Crypto Layer
 asv/
 ├── cli/        # Click commands (realm, vault, file)
 ├── core/       # Business logic (realm, vault, file operations)
-├── crypto/     # AES-128-CBC, HMAC-SHA256, PBKDF2, secure delete
+├── crypto/     # AES-256-GCM engine, PBKDF2-HMAC-SHA256, secure delete
 ├── db/         # Encrypted JSON database & snapshot management
-├── security/   # Password policy, permissions, path obfuscation
+├── security/   # Password policy, permissions, steganographic path obfuscation
 └── ui/         # Rich console output helpers
 ```
 
@@ -117,7 +118,7 @@ asv file encrypt secret-document.pdf --vault personal
 You'll be asked how to handle the original file:
 - **`keep`** — Leave the original untouched
 - **`simple`** — Delete the original (pointer removal)
-- **`secure`** — Overwrite with random bytes, then delete (irrecoverable)
+- **`secure`** — Overwrite with random bytes, then delete (best-effort)
 
 ### 5. List & decrypt files
 
@@ -146,15 +147,15 @@ asv realm lock
   </tr>
   <tr>
     <td><strong>Encryption</strong></td>
-    <td>AES-128-CBC with random 16-byte IV, PKCS7 padding</td>
+    <td>AES-256-GCM with random 12-byte nonce — authenticated encryption (AEAD)</td>
   </tr>
   <tr>
     <td><strong>Integrity</strong></td>
-    <td>HMAC-SHA256 computed over <code>IV + ciphertext</code></td>
+    <td>GCM authentication tag (16 bytes) — built-in, verified automatically on decryption</td>
   </tr>
   <tr>
     <td><strong>Key Derivation</strong></td>
-    <td>PBKDF2-HMAC-SHA256, 480,000 iterations, 16-byte random salt</td>
+    <td>PBKDF2-HMAC-SHA256, 480,000 iterations, 16-byte random salt → 32-byte AES-256 key</td>
   </tr>
   <tr>
     <td><strong>Permissions</strong></td>
@@ -162,7 +163,15 @@ asv realm lock
   </tr>
   <tr>
     <td><strong>Path Obfuscation</strong></td>
-    <td>HMAC-derived hashes for vault dirs and filenames</td>
+    <td>Triple-layer: <code>HMAC-SHA256(aes_key, name + pepper + salt)</code></td>
+  </tr>
+  <tr>
+    <td><strong>Pepper</strong></td>
+    <td>32-byte global random value per realm, stored encrypted at <code>pepper.enc</code></td>
+  </tr>
+  <tr>
+    <td><strong>Salt (per-vault/file)</strong></td>
+    <td>16-byte unique random value per vault and per file, stored in encrypted database</td>
   </tr>
   <tr>
     <td><strong>Password Policy</strong></td>
@@ -173,8 +182,10 @@ asv realm lock
 **Encrypted file format:**
 
 ```
-[16 bytes IV] [N bytes ciphertext (PKCS7)] [32 bytes HMAC-SHA256]
+[12 bytes nonce] [N bytes ciphertext] [16 bytes GCM auth tag]
 ```
+
+> **Why AES-256-GCM?** Unlike AES-128-CBC, GCM provides authenticated encryption in a single operation — no separate HMAC computation is needed, no padding is required, and integrity verification is automatic during decryption. This simplifies the cryptographic pipeline while increasing both key strength and security guarantees.
 
 ---
 
@@ -204,7 +215,7 @@ asv
 | Package | Purpose |
 |---------|---------|
 | [click](https://click.palletsprojects.com/) `≥ 8.0` | CLI framework |
-| [cryptography](https://cryptography.io/) `≥ 42.0` | AES, HMAC, PBKDF2 |
+| [cryptography](https://cryptography.io/) `≥ 42.0` | AES-256-GCM, HMAC, PBKDF2 |
 | [password-strength](https://pypi.org/project/password-strength/) `≥ 0.0.3` | Password validation |
 | [rich](https://rich.readthedocs.io/) `≥ 13.0` | Terminal UI |
 
@@ -212,7 +223,7 @@ asv
 
 ## 🗺️ Roadmap
 
-> These features are planned for post-MVP releases.
+> These features are planned for future releases.
 
 - [ ] Multiple realm support
 - [ ] Vault-level passwords
@@ -220,7 +231,7 @@ asv
 - [ ] Compression before encryption (gzip)
 - [ ] Key rotation
 - [ ] Export/import functionality
-- [ ] AES-256-GCM upgrade option
+- [ ] Configurable PBKDF2 iteration count
 - [ ] REST API mode
 - [ ] Systemd integration for session timeout
 
